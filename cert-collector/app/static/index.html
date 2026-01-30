@@ -1,0 +1,90 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Local Cert Collector</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, Arial; margin: 24px; max-width: 1000px; }
+    input, button { padding: 10px; font-size: 14px; }
+    input { width: 100%; margin: 6px 0; }
+    .row { display: grid; grid-template-columns: 2fr 1fr 1fr; gap: 10px; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 12px; margin: 10px 0; }
+    .status { font-weight: 700; }
+    .small { color: #555; font-size: 12px; }
+    button { cursor: pointer; }
+  </style>
+</head>
+<body>
+  <h1>Local Cert Collector</h1>
+  <p class="small">
+    Add any URL. The system will mark it <b>downloadable</b> only if it detects strong license markers.
+    Otherwise it goes to <b>needs_review</b>. You can manually approve a direct PDF download.
+  </p>
+
+  <h3>Add a candidate URL</h3>
+  <div class="row">
+    <input id="url" placeholder="URL (page or direct PDF link)" />
+    <input id="vendor" placeholder="vendor (comptia/microsoft/etc)" value="comptia" />
+    <input id="exam" placeholder="exam (SY0-701/AZ-900/etc)" value="unknown" />
+  </div>
+  <button onclick="add()">Add</button>
+  <button onclick="refresh()">Refresh list</button>
+
+  <h3>Items</h3>
+  <div id="items"></div>
+
+<script>
+async function refresh(){
+  const res = await fetch('/api/list');
+  const data = await res.json();
+  const el = document.getElementById('items');
+  el.innerHTML = '';
+  for(const it of data.items){
+    const div = document.createElement('div');
+    div.className = 'card';
+    div.innerHTML = `
+      <div><span class="status">${it.status}</span> — <span class="small">${it.reason || ''}</span></div>
+      <div class="small">${it.vendor}/${it.exam}</div>
+      <div style="margin:8px 0;"><a href="${it.url}" target="_blank" rel="noreferrer">${it.url}</a></div>
+      <div class="small">${it.saved_path ? ('Saved: ' + it.saved_path) : ''}</div>
+      <div style="display:flex; gap:10px; margin-top:10px;">
+        <button onclick="approve('${encodeURIComponent(it.url)}','${it.vendor}','${it.exam}')">Approve+Download PDF</button>
+      </div>
+    `;
+    el.appendChild(div);
+  }
+}
+
+async function add(){
+  const url = document.getElementById('url').value.trim();
+  const vendor = document.getElementById('vendor').value.trim() || 'unknown';
+  const exam = document.getElementById('exam').value.trim() || 'unknown';
+  if(!url){ alert('URL required'); return; }
+
+  const res = await fetch('/api/add', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({url, vendor, exam})
+  });
+  const out = await res.json();
+  if(!out.ok){ alert('Failed'); return; }
+  await refresh();
+}
+
+async function approve(urlEnc, vendor, exam){
+  const url = decodeURIComponent(urlEnc);
+  const res = await fetch('/api/approve_download', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({url, vendor, exam})
+  });
+  const out = await res.json();
+  if(!out.ok){ alert('Download failed: ' + JSON.stringify(out)); return; }
+  await refresh();
+}
+
+refresh();
+</script>
+</body>
+</html>

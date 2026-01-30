@@ -1,0 +1,1301 @@
+import os
+import time
+import shutil
+import threading
+import subprocess
+import random
+import re
+from pathlib import Path
+from queue import Queue, Empty
+
+import tkinter as tk
+from tkinter import ttk, filedialog
+
+import undetected_chromedriver as uc
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.common.exceptions import (
+    WebDriverException,
+    TimeoutException,
+    SessionNotCreatedException,
+)
+
+# -----------------------------
+# Optional notifications
+# -----------------------------
+try:
+    from plyer import notification
+    PLYER_AVAILABLE = True
+except Exception:
+    PLYER_AVAILABLE = False
+
+# -----------------------------
+# Paths / constants
+# -----------------------------
+USER_HOME = Path(os.environ.get("DTRPG_USER_HOME", str(Path.home())))
+AUTO_PROFILE_PATH = USER_HOME / ".config/google-chrome-automation"
+DEFAULT_STORAGE = USER_HOME / "Documents/DTRPG_QC_Project"
+CART_LIMIT = 50
+MAX_PAGES_DEFAULT = 50
+
+
+
+# DTRPG_QC_ENVFILE_V1
+CONFIG_DIR = USER_HOME / ".config/dtrpg_qc"
+ENV_FILE = CONFIG_DIR / "env"
+
+def load_env_file():
+    """Load DTRPG_EMAIL / DTRPG_PASSWORD from ~/.config/dtrpg_qc/env if not already in env."""
+    # If already present (e.g., exported in terminal), do nothing.
+    if os.getenv("DTRPG_EMAIL") and os.getenv("DTRPG_PASSWORD"):
+        return
+    try:
+        if not ENV_FILE.exists():
+            return
+        for line in ENV_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip()
+            v = v.strip().strip('"').strip("'")
+            if k in ("DTRPG_EMAIL", "DTRPG_PASSWORD") and not os.getenv(k):
+                os.environ[k] = v
+    except Exception:
+        # best-effort only
+        return
+
+def which_chrome() -> str:
+    for p in ["/usr/bin/google-chrome-stable", "/usr/bin/google-chrome", "/usr/bin/chromium-browser", "/usr/bin/chromium"]:
+        if Path(p).exists():
+            return p
+    for name in ["google-chrome-stable", "google-chrome", "chromium-browser", "chromium"]:
+        p = shutil.which(name)
+        if p:
+            return p
+    return "/usr/bin/google-chrome"
+
+
+CHROME_BIN = which_chrome()
+
+
+def detect_chrome_major(default=0) -> int:
+    try:
+        out = subprocess.check_output([CHROME_BIN, "--version"], text=True).strip()
+        # ex: "Google Chrome 144.0.7559.109"
+        for token in out.split():
+            if token and token[0].isdigit() and "." in token:
+                return int(token.split(".")[0])
+    except Exception:
+        pass
+    return default
+
+
+def is_invalid_session(exc: Exception) -> bool:
+    s = str(exc).lower()
+    return (
+        "invalid session id" in s
+        or "session deleted because of page crash" in s
+        or "chrome not reachable" in s
+        or "disconnected" in s
+        or "cannot connect to chrome" in s
+    )
+
+
+def chrome_using_profile(profile_dir: Path) -> bool:
+    for name in ["SingletonLock", "SingletonCookie", "SingletonSocket"]:
+        if (profile_dir / name).exists():
+            return True
+    return False
+
+
+def cleanup_profile_locks(profile_dir: Path):
+    for name in ["SingletonLock", "SingletonCookie", "SingletonSocket", "Lockfile"]:
+        try:
+            (profile_dir / name).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+class DTRPG_Enterprise_System:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("DTRPG QC — Stable Cart + Library Downloader")
+        self.root.geometry("900x780")
+
+
+        # DTRPG_QC_LOAD_ENV_IN_INIT_V1
+        load_env_file()
+        self.uiq: Queue = Queue()
+        self.stop_flag = threading.Event()
+
+        self.download_path = tk.StringVar(value=str(DEFAULT_STORAGE))
+        self.status_msg = tk.StringVar(value="System Ready")
+        self.progress_val = tk.IntVar(value=0)
+
+        self.pass_type = tk.StringVar(value="MANUAL")  # MANUAL or SYNC
+
+        env_has_creds = bool(os.getenv("DTRPG_EMAIL") and os.getenv("DTRPG_PASSWORD"))
+        self.auto_login_var = tk.BooleanVar(value=env_has_creds)
+        self.auto_checkout_var = tk.BooleanVar(value=False)
+        self.pause_on_fail_var = tk.BooleanVar(value=True)
+
+        # Stability tuning
+        self.add_wait_s = tk.DoubleVar(value=3.5)       # time to allow add action to complete
+        self.page_wait_s = tk.DoubleVar(value=6.0)      # after clicking Next
+        self.verify_timeout_s = tk.DoubleVar(value=25.0) # how long to wait for cart evidence
+        self.cooldown_every = tk.IntVar(value=4)
+        self.cooldown_s = tk.DoubleVar(value=10.0)
+        self.max_pages = tk.IntVar(value=MAX_PAGES_DEFAULT)
+
+        # Safe behavior
+        self.only_free_or_pwyw = tk.BooleanVar(value=True)
+
+        self.items_carted = 0
+        self.notifications_active = True
+
+        # resume helpers
+        self.seed_list_url = None
+        self.last_list_url = None
+
+        self.setup_ui()
+        self.root.after(100, self._drain_ui_queue)
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    # -----------------------------
+    # UI helpers
+    # -----------------------------
+    def _drain_ui_queue(self):
+        try:
+            while True:
+                fn = self.uiq.get_nowait()
+                try:
+                    fn()
+                except Exception:
+                    pass
+        except Empty:
+            pass
+        self.root.after(100, self._drain_ui_queue)
+
+    def ui(self, fn):
+        self.uiq.put(fn)
+
+    def log(self, message: str):
+        ts = time.strftime("%H:%M:%S")
+        def _do():
+            self.log_box.insert(tk.END, f"[{ts}] {message}")
+            self.log_box.see(tk.END)
+        self.ui(_do)
+
+    def set_progress(self, pct: int):
+        self.ui(lambda: self.progress_val.set(int(max(0, min(100, pct)))))
+
+    def set_status(self, s: str):
+        self.ui(lambda: self.status_msg.set(s))
+
+    def blocking_modal(self, title: str, msg: str, button_text="Continue"):
+        gate = threading.Event()
+
+        def _do():
+            try:
+                self.root.deiconify()
+                self.root.lift()
+                self.root.focus_force()
+                self.root.attributes("-topmost", True)
+                self.root.after(250, lambda: self.root.attributes("-topmost", False))
+            except Exception:
+                pass
+
+            win = tk.Toplevel(self.root)
+            win.title(title)
+            win.transient(self.root)
+            win.grab_set()
+            try:
+                win.attributes("-topmost", True)
+            except Exception:
+                pass
+
+            frm = ttk.Frame(win, padding=16)
+            frm.pack(fill="both", expand=True)
+
+            lbl = ttk.Label(frm, text=msg, justify="left", wraplength=760)
+            lbl.pack(fill="both", expand=True)
+
+            def close():
+                try:
+                    win.grab_release()
+                except Exception:
+                    pass
+                try:
+                    win.destroy()
+                except Exception:
+                    pass
+                gate.set()
+
+            btn = ttk.Button(frm, text=button_text, command=close)
+            btn.pack(pady=(12, 0))
+            win.protocol("WM_DELETE_WINDOW", close)
+
+            win.update_idletasks()
+            x = self.root.winfo_rootx() + (self.root.winfo_width() // 2) - (win.winfo_width() // 2)
+            y = self.root.winfo_rooty() + (self.root.winfo_height() // 2) - (win.winfo_height() // 2)
+            win.geometry(f"+{max(0, x)}+{max(0, y)}")
+            btn.focus_set()
+
+        self.ui(_do)
+        gate.wait()
+
+    # -----------------------------
+    # UI layout
+    # -----------------------------
+
+    def setup_ui(self):
+        # DTRPG_QC_STICKY_FOOTER_V1
+        # Use grid so the footer stays visible when the window is resized smaller.
+        self.root.minsize(760, 520)
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(1, weight=1)  # log row expands/shrinks
+
+        top = ttk.Frame(self.root, padding=10)
+        top.grid(row=0, column=0, sticky="ew")
+        top.columnconfigure(0, weight=1)
+
+        frame_pass = ttk.LabelFrame(top, text="Mode", padding=10)
+        frame_pass.grid(row=0, column=0, sticky="ew")
+        ttk.Radiobutton(
+            frame_pass,
+            text="Mode A: Manual Filter (Add-to-cart)",
+            variable=self.pass_type,
+            value="MANUAL",
+        ).pack(side="left", padx=10)
+        ttk.Radiobutton(
+            frame_pass,
+            text="Mode B: Library Sync (Download owned)",
+            variable=self.pass_type,
+            value="SYNC",
+        ).pack(side="left", padx=10)
+
+        frame_dir = ttk.LabelFrame(top, text="Download Folder", padding=10)
+        frame_dir.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        frame_dir.columnconfigure(0, weight=1)
+        ttk.Entry(frame_dir, textvariable=self.download_path).grid(row=0, column=0, sticky="ew")
+        ttk.Button(frame_dir, text="Browse", command=self._browse_dir).grid(row=0, column=1, sticky="e", padx=(10, 0))
+
+        frame_opts = ttk.LabelFrame(top, text="Automation Options", padding=10)
+        frame_opts.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        ttk.Checkbutton(
+            frame_opts,
+            text="Auto-login (uses DTRPG_EMAIL / DTRPG_PASSWORD env vars or ~/.config/dtrpg_qc/env)",
+            variable=self.auto_login_var,
+        ).grid(row=0, column=0, sticky="w", padx=6, pady=2)
+        ttk.Checkbutton(
+            frame_opts,
+            text="Auto-checkout → Library → Download (after adds / at end)",
+            variable=self.auto_checkout_var,
+        ).grid(row=1, column=0, sticky="w", padx=6, pady=2)
+        ttk.Checkbutton(
+            frame_opts,
+            text="Pause on failures (recommended)",
+            variable=self.pause_on_fail_var,
+        ).grid(row=2, column=0, sticky="w", padx=6, pady=2)
+
+        frame_tune = ttk.LabelFrame(top, text="Stability Tuning (Slower = more reliable)", padding=10)
+        frame_tune.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        frame_tune.columnconfigure(1, weight=0)
+
+        def add_row(r, label, var):
+            ttk.Label(frame_tune, text=label).grid(row=r, column=0, sticky="w", padx=6, pady=2)
+            ttk.Entry(frame_tune, textvariable=var, width=10).grid(row=r, column=1, sticky="w", padx=6, pady=2)
+
+        add_row(0, "Add-to-cart wait (sec):", self.add_wait_s)
+        add_row(1, "Page change wait (sec):", self.page_wait_s)
+        add_row(2, "Verify timeout (sec):", self.verify_timeout_s)
+        add_row(3, "Cooldown every N adds:", self.cooldown_every)
+        add_row(4, "Cooldown duration (sec):", self.cooldown_s)
+        add_row(5, "Max pages to scan:", self.max_pages)
+
+        frame_prog = ttk.LabelFrame(top, text="Progress", padding=10)
+        frame_prog.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        ttk.Progressbar(frame_prog, variable=self.progress_val, maximum=100).pack(fill="x", pady=4)
+        ttk.Label(frame_prog, textvariable=self.status_msg).pack(anchor="w")
+
+        # Log area (expands) + scrollbar
+        log_frame = ttk.Frame(self.root, padding=(10, 0, 10, 10))
+        log_frame.grid(row=1, column=0, sticky="nsew")
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(0, weight=1)
+
+        self.log_box = tk.Listbox(log_frame, height=18, bg="#000000", fg="#00FF00", font=("Courier", 10))
+        scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_box.yview)
+        self.log_box.configure(yscrollcommand=scroll.set)
+
+        self.log_box.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+
+        # Sticky footer
+        bottom = ttk.Frame(self.root, padding=10)
+        bottom.grid(row=2, column=0, sticky="ew")
+        bottom.columnconfigure(2, weight=1)  # spacer
+
+        self.start_btn = ttk.Button(bottom, text="LAUNCH AUTOMATION", command=self.start_thread)
+        self.start_btn.grid(row=0, column=0, sticky="w")
+
+        self.stop_btn = ttk.Button(bottom, text="STOP", command=self.request_stop)
+        self.stop_btn.grid(row=0, column=1, sticky="w", padx=(10, 0))
+
+        ttk.Label(bottom, text=f"Chrome: {CHROME_BIN}").grid(row=0, column=3, sticky="e")
+    def _browse_dir(self):
+        d = filedialog.askdirectory()
+        if d:
+            self.download_path.set(d)
+
+    def on_close(self):
+        self.request_stop()
+        self.root.after(200, self.root.destroy)
+
+    def request_stop(self):
+        self.stop_flag.set()
+        self.log("STOP: requested by user.")
+
+    # -----------------------------
+    # Notifications
+    # -----------------------------
+    def send_notification(self, title, message):
+        if PLYER_AVAILABLE and self.notifications_active:
+            try:
+                notification.notify(title=title, message=message, app_name="DTRPG QC", timeout=5)
+            except Exception as e:
+                self.notifications_active = False
+                self.log(f"WARN: Notify failed; disabling ({e})")
+        else:
+            self.log(f"NOTIFY: {title} — {message}")
+
+    # -----------------------------
+    # Timing helpers
+    # -----------------------------
+    def human_sleep(self, base_s: float, jitter: float = 0.45):
+        # adds randomness so you don't hammer pages in a bot-like pattern
+        s = max(0.0, float(base_s))
+        j = s * float(jitter)
+        time.sleep(max(0.0, random.uniform(s - j, s + j)))
+
+    def wait_doc_ready(self, driver, timeout=20):
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                rs = driver.execute_script("return document.readyState") or ""
+                if rs == "complete":
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.15)
+        return False
+
+    # -----------------------------
+    # Debug helpers
+    # -----------------------------
+    def debug_dump(self, driver, tag: str):
+        try:
+            base = Path(self.download_path.get())
+            dbg = base / "_debug"
+            dbg.mkdir(parents=True, exist_ok=True)
+            driver.save_screenshot(str(dbg / f"{tag}.png"))
+            (dbg / f"{tag}.html").write_text(driver.page_source, encoding="utf-8", errors="replace")
+            (dbg / f"{tag}.url.txt").write_text(driver.current_url, encoding="utf-8", errors="replace")
+            self.log(f"DEBUG: dumped {tag} -> {dbg}")
+        except Exception as e:
+            self.log(f"DEBUG: dump failed: {e}")
+
+    # -----------------------------
+    # Selenium helpers
+    # -----------------------------
+    def smart_click(self, driver, element):
+        try:
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
+            time.sleep(0.25)
+        except Exception:
+            pass
+        try:
+            element.click()
+            return "native"
+        except Exception:
+            pass
+        try:
+            ActionChains(driver).move_to_element(element).pause(0.1).click(element).perform()
+            return "actions"
+        except Exception:
+            pass
+        try:
+            driver.execute_script("arguments[0].click();", element)
+        except Exception:
+            pass
+        return "js"
+
+    def is_logged_in(self, driver) -> bool:
+        try:
+            html = (driver.page_source or "").lower()
+        except Exception:
+            return False
+        return ("logoff" in html) or ("my account" in html) or ("/en/library" in html)
+
+    def has_real_challenge(self, driver) -> bool:
+        """
+        IMPORTANT:
+        - We do NOT trigger on mere presence of 'turnstile' text anymore (false positives).
+        - We trigger only when actual challenge DOM elements / CF URLs appear.
+        """
+        try:
+            url = (driver.current_url or "").lower()
+        except Exception:
+            url = ""
+
+        try:
+            title = (driver.execute_script("return document.title") or "").lower()
+        except Exception:
+            title = ""
+
+        # URL/title signals (strong)
+        if "cdn-cgi" in url or "challenge-platform" in url:
+            return True
+        if "just a moment" in title or "checking your browser" in title:
+            return True
+
+        # DOM signals (strong)
+        js = r"""
+        try {
+          const sels = [
+            "div.cf-turnstile",
+            "input[name='cf-turnstile-response']",
+            "iframe[src*='turnstile']",
+            "iframe[src*='challenge']",
+            "iframe[id*='cf']",
+            "#cf-challenge-running",
+            "form[action*='challenge']",
+            "div[id*='challenge']"
+          ];
+          for (const sel of sels) {
+            const el = document.querySelector(sel);
+            if (el) return true;
+          }
+          // Classic CF page text blocks
+          const body = (document.body && document.body.innerText || "").toLowerCase();
+          if (body.includes("checking your browser") || body.includes("verify you are human") || body.includes("just a moment")) return true;
+          return false;
+        } catch(e) { return false; }
+        """
+        try:
+            return bool(driver.execute_script(js))
+        except Exception:
+            return False
+
+
+    def guard_interstitial(self, driver, context: str) -> bool:
+        # DTRPG_QC_GUARD_V2
+        # Only trigger on strong challenge artifacts (reduces false positives).
+        try:
+            url = driver.current_url or ""
+        except Exception:
+            url = ""
+        url_l = url.lower()
+
+        try:
+            title = driver.execute_script("return document.title") or ""
+        except Exception:
+            title = ""
+        title_l = title.lower()
+
+        try:
+            html = (driver.page_source or "").lower()
+        except Exception:
+            html = ""
+
+        strong_html = (
+            "cf-browser-verification" in html
+            or "challenge-platform" in html
+            or "cdn-cgi/challenge-platform" in html
+            or "cf-turnstile" in html
+            or "hcaptcha" in html
+            or "recaptcha" in html
+        )
+        strong_url = ("cdn-cgi" in url_l) or ("challenge-platform" in url_l)
+        strong_title = ("just a moment" in title_l) or ("checking your browser" in title_l)
+
+        if strong_html or strong_url or strong_title:
+            self.log(f"GUARD: verification detected ({context}) title='{title}' url={url}")
+            self.debug_dump(driver, f"interstitial_{context}")
+            dbg_dir = str(Path(self.download_path.get()) / "_debug")
+            self.blocking_modal(
+                "Verification Detected",
+                "A verification/challenge page was detected.\n\n"
+                f"Chrome tab title: {title}\n"
+                f"URL: {url}\n\n"
+                "IMPORTANT: It may be in a NEW TAB and Chrome might not come to the front.\n"
+                "Alt-Tab to Chrome and look for a tab that says 'Just a moment…' or similar.\n\n"
+                f"If you still don't see it, open the saved screenshot in:\n{dbg_dir}\n\n"
+                "Solve it in Chrome, then click Continue."
+            )
+            return True
+
+        # Logged-out guard
+        if "login" in url_l and not self.is_logged_in(driver):
+            self.log(f"GUARD: login page detected ({context}) url={url}")
+            self.blocking_modal(
+                "Login Required",
+                "You appear to be logged out.\n\n"
+                "Log in in Chrome, then click Continue.\n"
+                "Afterwards return to your filtered results page."
+            )
+            return True
+
+        return False
+    def get_cart_badge_count(self, driver):
+        candidates = [
+            (By.CSS_SELECTOR, "#cart_count"),
+            (By.CSS_SELECTOR, ".cart-count"),
+            (By.CSS_SELECTOR, "a[href*='cart'] .count"),
+            (By.CSS_SELECTOR, "a[href*='cart'] span"),
+        ]
+        for by, sel in candidates:
+            try:
+                el = driver.find_element(by, sel)
+                txt = (el.text or "").strip()
+                digits = "".join(c for c in txt if c.isdigit())
+                if digits:
+                    return int(digits)
+            except Exception:
+                pass
+        return None
+
+    def wait_cart_change(self, driver, before, timeout_s: float):
+        if before is None:
+            return None
+        end = time.time() + timeout_s
+        while time.time() < end:
+            now = self.get_cart_badge_count(driver)
+            if now is not None and now != before:
+                return True
+            time.sleep(0.25)
+        return False
+
+    def find_add_to_cart_button(self, driver):
+        xpath = ("//input[@type='submit' and contains(translate(@value,"
+                 "'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'cart')]"
+                 "|//button[contains(translate(.,"
+                 "'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'add to cart')]"
+                 "|//button[contains(translate(.,"
+                 "'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'cart')]")
+        try:
+            els = driver.find_elements(By.XPATH, xpath)
+            for el in els:
+                try:
+                    if el.is_displayed() and el.is_enabled():
+                        return el
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return None
+
+    def find_next_page_el(self, driver):
+        candidates = [
+            (By.CSS_SELECTOR, "nav.pagination a[rel='next']"),
+            (By.CSS_SELECTOR, "nav.pagination a.next"),
+            (By.CSS_SELECTOR, ".pagination a[rel='next']"),
+            (By.CSS_SELECTOR, ".pagination a.next"),
+            (By.CSS_SELECTOR, "a[rel='next']"),
+        ]
+        for by, sel in candidates:
+            try:
+                el = driver.find_element(by, sel)
+                if el and el.is_displayed() and el.is_enabled():
+                    return el
+            except Exception:
+                pass
+
+        # last resort: visible link containing "Next"
+        try:
+            els = driver.find_elements(By.XPATH, "//a[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'next')]")
+            for el in els:
+                try:
+                    if el.is_displayed() and el.is_enabled():
+                        return el
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return None
+
+    def product_is_safe_free_or_pwyw(self, driver) -> bool:
+        """
+        SAFE MODE:
+        Only add if Free/$0.00 or PWYW field exists.
+        """
+        # PWYW input field detection
+        for fid in ["pwyw_price", "pwyw_amount", "amount", "price"]:
+            try:
+                field = driver.find_element(By.ID, fid)
+                if field.is_displayed() and field.is_enabled():
+                    return True
+            except Exception:
+                continue
+
+        # Text cues
+        try:
+            body = (driver.find_element(By.TAG_NAME, "body").text or "").lower()
+        except Exception:
+            body = ""
+        if "$0.00" in body or "free" in body:
+            return True
+        return False
+
+    # -----------------------------
+    # Login automation
+    # -----------------------------
+    def try_auto_login(self, driver, wait) -> bool:
+        email = os.getenv("DTRPG_EMAIL", "").strip()
+        pw = os.getenv("DTRPG_PASSWORD", "").strip()
+        if not (email and pw):
+            self.log("AUTOLOGIN: env vars not set; skipping.")
+            return False
+
+        self.log("AUTOLOGIN: attempting…")
+        driver.get("https://www.drivethrurpg.com/login.php")
+        self.wait_doc_ready(driver, timeout=20)
+        self.human_sleep(1.0)
+
+        if self.guard_interstitial(driver, "autologin"):
+            # user solved; continue
+            pass
+
+        def find_any(selectors):
+            for by, sel in selectors:
+                try:
+                    el = driver.find_element(by, sel)
+                    if el and el.is_displayed():
+                        return el
+                except Exception:
+                    pass
+            return None
+
+        email_el = find_any([
+            (By.NAME, "email_address"),
+            (By.ID, "email_address"),
+            (By.CSS_SELECTOR, "input[type='email']"),
+            (By.CSS_SELECTOR, "input[name*='email']"),
+        ])
+        pw_el = find_any([
+            (By.NAME, "password"),
+            (By.ID, "password"),
+            (By.CSS_SELECTOR, "input[type='password']"),
+        ])
+
+        if not email_el or not pw_el:
+            self.log("AUTOLOGIN: could not locate login fields.")
+            self.debug_dump(driver, "autologin_no_fields")
+            return False
+
+        try:
+            email_el.clear()
+            email_el.send_keys(email)
+            pw_el.clear()
+            pw_el.send_keys(pw)
+        except Exception:
+            pass
+
+        btn = find_any([
+            (By.CSS_SELECTOR, "input[type='submit']"),
+            (By.CSS_SELECTOR, "button[type='submit']"),
+        ])
+        if btn:
+            self.smart_click(driver, btn)
+        else:
+            try:
+                pw_el.submit()
+            except Exception:
+                pass
+
+        # wait for login success
+        for _ in range(80):
+            if self.is_logged_in(driver) and "login.php" not in (driver.current_url or "").lower():
+                self.log("AUTOLOGIN: success.")
+                return True
+            time.sleep(0.25)
+
+        self.log("AUTOLOGIN: did not confirm login (manual may be required).")
+        self.debug_dump(driver, "autologin_not_confirmed")
+        return False
+
+    # -----------------------------
+    # Chrome start
+    # -----------------------------
+    def start_driver(self):
+        AUTO_PROFILE_PATH.mkdir(parents=True, exist_ok=True)
+
+        if chrome_using_profile(AUTO_PROFILE_PATH):
+            self.blocking_modal(
+                "Close Chrome",
+                f"Chrome is already using this automation profile:\n{AUTO_PROFILE_PATH}\n\n"
+                "Close ALL Chrome windows, then click Continue."
+            )
+
+        if not chrome_using_profile(AUTO_PROFILE_PATH):
+            cleanup_profile_locks(AUTO_PROFILE_PATH)
+
+        major = detect_chrome_major(default=0) or 0
+        self.log(f"Chrome detected: major={major} bin={CHROME_BIN}")
+
+        last_err = None
+        for attempt in range(1, 4):
+            try:
+                options = uc.ChromeOptions()
+                options.add_argument("--disable-popup-blocking")
+                options.add_argument("--disable-dev-shm-usage")
+                options.add_argument("--no-first-run")
+                options.add_argument("--no-default-browser-check")
+                options.add_argument("--disable-features=Translate,BackForwardCache")
+                options.add_argument("--no-sandbox")
+                options.add_argument(f"--user-data-dir={str(AUTO_PROFILE_PATH)}")
+
+                prefs = {
+                    "download.default_directory": self.download_path.get(),
+                    "download.prompt_for_download": False,
+                    "plugins.always_open_pdf_externally": True,
+                }
+                options.add_experimental_option("prefs", prefs)
+
+                self.log(f"Starting Chrome (attempt {attempt}/3)…")
+
+                kwargs = dict(
+                    options=options,
+                    browser_executable_path=CHROME_BIN,
+                    port=0,
+                )
+                if major > 0:
+                    kwargs["version_main"] = major
+
+                return uc.Chrome(**kwargs)
+
+            except SessionNotCreatedException as e:
+                last_err = e
+                msg = str(e)
+                self.log(f"Start failed (SessionNotCreated): {msg}")
+
+                if "only supports chrome version" in msg.lower():
+                    self.log("UC cache mismatch detected — purging cached driver and retrying…")
+                    try:
+                        shutil.rmtree(str(USER_HOME / ".local/share/undetected_chromedriver"), ignore_errors=True)
+                    except Exception:
+                        pass
+                    major = detect_chrome_major(default=major or 0)
+                    time.sleep(1.0)
+                    continue
+
+                time.sleep(1.0)
+
+            except Exception as e:
+                last_err = e
+                self.log(f"Start failed: {e}")
+                time.sleep(1.0)
+
+        raise RuntimeError(f"Chrome failed to start after 3 attempts: {last_err}")
+
+    # -----------------------------
+    # Thread runner
+    # -----------------------------
+    def start_thread(self):
+        Path(self.download_path.get()).mkdir(parents=True, exist_ok=True)
+        self.stop_flag.clear()
+        self.start_btn.config(state="disabled")
+        threading.Thread(target=self.run_process, daemon=True).start()
+
+    def run_process(self):
+        driver = None
+        current_pass = self.pass_type.get()
+        self.items_carted = 0
+
+        try:
+            self.set_status("Starting Chrome…")
+            self.log(f"SYSTEM: Mode={current_pass}")
+
+            driver = self.start_driver()
+            wait = WebDriverWait(driver, 25)
+
+
+            # DTRPG_QC_FORCE_DTRPG_NAV_V1
+            self.set_status("Opening DriveThruRPG…")
+            driver.get("https://www.drivethrurpg.com/login.php")
+            time.sleep(2.0)
+            # DTRPG_OPEN_LOGIN_V1
+            self.set_status("Opening DriveThruRPG…")
+            try:
+                driver.get("https://www.drivethrurpg.com/login.php")
+            except Exception:
+                driver.get("https://www.drivethrurpg.com/")
+            time.sleep(2.0)
+
+            # Login
+            self.set_status("Login…")
+            if self.auto_login_var.get():
+                self.try_auto_login(driver, wait)
+
+            if not self.is_logged_in(driver):
+                self.blocking_modal(
+                    "Login Required",
+                    "Please login in the Chrome window.\n\nAfter you are logged in, click Continue."
+                )
+
+            if self.stop_flag.is_set():
+                return
+
+            if current_pass == "SYNC":
+                self.set_status("SYNC: Opening library…")
+                self.sync_library(driver, wait)
+            else:
+                self.set_status("MANUAL: Awaiting filtered page…")
+                self.blocking_modal(
+                    "Ready to Scrape",
+                    "1) In Chrome: set your filters (D&D 5e / Free / etc)\n"
+                    "2) Make sure you are on the EXACT results page you want scraped\n"
+                    "3) Click Continue here\n\n"
+                    "Tip: the bot will preserve your filter state and slow down for reliability."
+                )
+                self.seed_list_url = driver.current_url
+                self.last_list_url = self.seed_list_url
+                self.log(f"ACQUIRE: Seed filtered URL locked: {self.seed_list_url}")
+
+                self.set_status("ACQUIRE: Running…")
+
+                # Self-healing: restart once if Chrome/driver crashes mid-run
+                for cycle in range(2):
+                    try:
+                        self.acquire_across_pages(driver, wait)
+                        break
+                    except Exception as e:
+                        if not is_invalid_session(e):
+                            raise
+                        self.log(f"RECOVER: browser session died ({e}). Restarting once…")
+                        try:
+                            driver.quit()
+                        except Exception:
+                            pass
+                        if self.stop_flag.is_set():
+                            return
+                        driver = self.start_driver()
+                        wait = WebDriverWait(driver, 25)
+                        if self.auto_login_var.get():
+                            self.try_auto_login(driver, wait)
+                        # resume to last known list URL
+                        resume = self.last_list_url or self.seed_list_url
+                        if resume:
+                            driver.get(resume)
+                            self.wait_doc_ready(driver, timeout=20)
+                            self.human_sleep(2.0)
+
+                if self.auto_checkout_var.get() and not self.stop_flag.is_set():
+                    self.checkout_and_download(driver, wait)
+
+        except Exception as e:
+            self.log(f"CRITICAL: {e}")
+            try:
+                if driver:
+                    self.debug_dump(driver, "critical_exception")
+            except Exception:
+                pass
+        finally:
+            self.set_status("Complete")
+            self.send_notification("DTRPG QC", f"{current_pass} run finished.")
+            if driver:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+            self.ui(lambda: self.start_btn.config(state="normal"))
+
+    # -----------------------------
+    # Mode B: Sync library
+    # -----------------------------
+    def sync_library(self, driver, wait):
+        if self.stop_flag.is_set():
+            return
+
+        self.log("SYNC: opening library…")
+        driver.get("https://www.drivethrurpg.com/en/library")
+        self.wait_doc_ready(driver, timeout=25)
+        self.human_sleep(2.0)
+
+        if self.guard_interstitial(driver, "library"):
+            pass
+
+        base = Path(self.download_path.get())
+        base.mkdir(parents=True, exist_ok=True)
+
+        existing = set()
+        for root, _, files in os.walk(base):
+            for f in files:
+                existing.add(f.lower())
+
+        links = driver.find_elements(By.CSS_SELECTOR, "a[href*='download_file']")
+        self.log(f"SYNC: found {len(links)} download links (best-effort).")
+
+        to_click = []
+        for a in links:
+            try:
+                title = (a.get_attribute("title") or a.text or "").strip()
+                clean = title.replace("Download ", "").strip()
+                if clean and clean.lower() not in existing:
+                    to_click.append(a)
+            except Exception:
+                pass
+
+        self.log(f"SYNC: {len(to_click)} appear new vs local folder.")
+        for i, a in enumerate(to_click, start=1):
+            if self.stop_flag.is_set():
+                return
+            try:
+                self.smart_click(driver, a)
+                self.human_sleep(2.2)
+            except Exception:
+                pass
+            self.set_progress(int((i / max(1, len(to_click))) * 100))
+
+    # -----------------------------
+    # Mode A: Acquire across pages (preserve filters)
+    # -----------------------------
+    def acquire_across_pages(self, driver, wait):
+        add_wait = float(self.add_wait_s.get())
+        page_wait = float(self.page_wait_s.get())
+        verify_t = float(self.verify_timeout_s.get())
+        cd_every = int(self.cooldown_every.get())
+        cd_s = float(self.cooldown_s.get())
+        max_pages = int(self.max_pages.get())
+
+        page = 0
+        adds = 0
+
+        while page < max_pages and not self.stop_flag.is_set():
+            page += 1
+
+            self.last_list_url = driver.current_url
+
+            if self.guard_interstitial(driver, f"list_page_{page}"):
+                pass
+
+            self.wait_doc_ready(driver, timeout=25)
+            self.human_sleep(1.2)
+
+            self.log(f"LIST: page {page} scanning…")
+
+            # collect product URLs
+            try:
+                links = driver.find_elements(By.CSS_SELECTOR, "a[href*='/product/']")
+            except Exception:
+                links = []
+
+            urls = []
+            for el in links:
+                try:
+                    href = el.get_attribute("href")
+                    if href and "/product/" in href:
+                        urls.append(href)
+                except Exception:
+                    pass
+
+            # dedupe preserving order
+            seen = set()
+            urls2 = []
+            for u in urls:
+                if u not in seen:
+                    seen.add(u)
+                    urls2.append(u)
+
+            if not urls2:
+                self.log("WARN: no product links found — filters may be lost.")
+                self.debug_dump(driver, f"no_products_page_{page}")
+                self.blocking_modal(
+                    "No Products Found",
+                    "No product links were found on this page.\n\n"
+                    "Restore your filters/results in Chrome, then click Continue."
+                )
+                continue
+
+            self.log(f"LIST: found {len(urls2)} products on page {page}.")
+            list_handle = driver.current_window_handle
+
+            for i, url in enumerate(urls2, start=1):
+                if self.stop_flag.is_set():
+                    return
+
+                if self.items_carted >= CART_LIMIT:
+                    self.log("CART: reached limit (50).")
+                    if self.auto_checkout_var.get():
+                        self.checkout_and_download(driver, wait)
+                        self.items_carted = 0
+                        self.blocking_modal(
+                            "Restore Filters",
+                            "After checkout, please return to your filtered results page.\n\nWhen ready, click Continue."
+                        )
+                        self.seed_list_url = driver.current_url
+                        self.last_list_url = self.seed_list_url
+                    else:
+                        self.blocking_modal("Cart Limit", "Cart is full (50). Checkout manually, then Continue.")
+                        self.items_carted = 0
+
+                ok = self.add_product_to_cart(driver, wait, url, list_handle, add_wait, verify_t)
+                if ok:
+                    self.items_carted += 1
+                    adds += 1
+
+                if cd_every > 0 and adds > 0 and adds % cd_every == 0:
+                    self.log(f"COOLDOWN: sleeping {cd_s}s (anti-rate-limit)…")
+                    time.sleep(cd_s)
+
+                self.set_progress(int(((i) / max(1, len(urls2))) * 100))
+
+            nxt = self.find_next_page_el(driver)
+            if not nxt:
+                self.log("LIST: no Next page found — done.")
+                return
+
+            prev = driver.current_url
+            self.log("LIST: moving to next page…")
+            try:
+                self.smart_click(driver, nxt)
+            except Exception:
+                try:
+                    href = nxt.get_attribute("href")
+                    if href:
+                        driver.get(href)
+                except Exception:
+                    return
+
+            self.human_sleep(page_wait)
+
+            # confirm URL changed (best-effort)
+            for _ in range(60):
+                if self.stop_flag.is_set():
+                    return
+                try:
+                    if driver.current_url != prev:
+                        break
+                except Exception:
+                    break
+                time.sleep(0.2)
+
+    def add_product_to_cart(self, driver, wait, url, list_handle, add_wait, verify_t) -> bool:
+        """
+        Key changes:
+        - Verify cart change WHILE STILL ON PRODUCT TAB before closing it.
+        - SAFE MODE: skip anything not Free/$0/PWYW.
+        - Longer, human-like waits so the add can actually complete.
+        """
+        step = "start"
+        used_same_tab = False
+        before = None
+
+        try:
+            # capture cart count before opening product (from list tab)
+            try:
+                before = self.get_cart_badge_count(driver)
+            except Exception:
+                before = None
+
+            # open product in new tab (preserve filters)
+            step = "open_tab"
+            try:
+                driver.execute_script("window.open(arguments[0], '_blank');", url)
+                self.human_sleep(0.6)
+                driver.switch_to.window(driver.window_handles[-1])
+            except Exception:
+                used_same_tab = True
+                driver.get(url)
+
+            step = "wait_body"
+            self.wait_doc_ready(driver, timeout=25)
+            self.human_sleep(1.2)
+
+            if self.guard_interstitial(driver, "product"):
+                pass
+
+            # SAFE mode gate
+            if self.only_free_or_pwyw.get():
+                if not self.product_is_safe_free_or_pwyw(driver):
+                    self.log(f"SKIP: not Free/$0/PWYW: {url}")
+                    # close product tab
+                    try:
+                        if not used_same_tab:
+                            driver.close()
+                            driver.switch_to.window(list_handle)
+                        else:
+                            driver.back()
+                    except Exception:
+                        try:
+                            driver.switch_to.window(list_handle)
+                        except Exception:
+                            pass
+                    self.human_sleep(0.8)
+                    return False
+
+            # If PWYW field exists, set 0 (safe)
+            step = "pwyw"
+            for fid in ["pwyw_price", "pwyw_amount", "amount", "price"]:
+                try:
+                    field = driver.find_element(By.ID, fid)
+                    if field.is_displayed() and field.is_enabled():
+                        try:
+                            field.clear()
+                            field.send_keys("0")
+                        except Exception:
+                            pass
+                        break
+                except Exception:
+                    continue
+
+            step = "find_btn"
+            btn = self.find_add_to_cart_button(driver)
+            if not btn:
+                self.log(f"WARN: no Add-to-Cart button: {url}")
+                self.debug_dump(driver, "no_add_button")
+                if self.pause_on_fail_var.get():
+                    self.blocking_modal("Add-to-cart failed", "Could not find Add-to-Cart.\nFix in Chrome, then Continue.")
+                # close tab
+                try:
+                    if not used_same_tab:
+                        driver.close()
+                        driver.switch_to.window(list_handle)
+                except Exception:
+                    pass
+                return False
+
+            step = "click"
+            m = self.smart_click(driver, btn)
+            self.log(f"ADD: clicked ({m}) {url.split('/')[-1]}")
+
+            # IMPORTANT: wait for evidence of add while still on product tab
+            self.human_sleep(add_wait)
+
+            evidence = False
+
+            # Evidence 1: cart badge change (works on many pages)
+            if before is not None:
+                ok = self.wait_cart_change(driver, before, timeout_s=verify_t)
+                if ok is True:
+                    evidence = True
+
+            # Evidence 2: URL indicates cart
+            try:
+                if "cart.php" in (driver.current_url or "").lower():
+                    evidence = True
+            except Exception:
+                pass
+
+            # Evidence 3: common success text
+            try:
+                body = (driver.find_element(By.TAG_NAME, "body").text or "").lower()
+                if "added to your cart" in body or "shopping cart" in body:
+                    evidence = True
+            except Exception:
+                pass
+
+            # close product tab and return to list
+            step = "return_list"
+            try:
+                if not used_same_tab:
+                    driver.close()
+                    driver.switch_to.window(list_handle)
+                else:
+                    driver.back()
+            except Exception:
+                try:
+                    driver.switch_to.window(list_handle)
+                except Exception:
+                    pass
+
+            self.wait_doc_ready(driver, timeout=20)
+            self.human_sleep(1.0)
+
+            if evidence:
+                self.log("ADD: verified add evidence.")
+                return True
+
+            self.log("WARN: no add evidence detected (may be blocked or slow).")
+            if self.pause_on_fail_var.get():
+                self.debug_dump(driver, "add_no_evidence")
+                self.blocking_modal(
+                    "Add may have failed",
+                    "No evidence the item was added.\n\n"
+                    "Check Chrome (cart count / cart page). If it did add, click Continue.\n"
+                    "If not, adjust filters or slow settings, then Continue."
+                )
+            return False
+
+        except (WebDriverException, TimeoutException) as e:
+            if is_invalid_session(e):
+                raise
+            self.log(f"WARN: add failed at step={step}: {e}")
+            self.debug_dump(driver, f"add_fail_{step}")
+            return False
+
+        except Exception as e:
+            if is_invalid_session(e):
+                raise
+            self.log(f"WARN: add failed at step={step}: {e}")
+            self.debug_dump(driver, f"add_fail_{step}")
+            return False
+
+    # -----------------------------
+    # Checkout -> Library -> Download
+    # -----------------------------
+    def checkout_and_download(self, driver, wait):
+        if self.stop_flag.is_set():
+            return
+
+        self.log("CHECKOUT: opening cart…")
+        driver.get("https://www.drivethrurpg.com/cart.php")
+        self.wait_doc_ready(driver, timeout=25)
+        self.human_sleep(2.0)
+
+        if self.guard_interstitial(driver, "cart"):
+            pass
+
+        # SAFE: do NOT auto-finalize purchase.
+        # We navigate you to cart, then you confirm + finish (prevents accidental non-free checkout).
+        self.blocking_modal(
+            "Checkout (SAFE)",
+            "Complete the checkout in Chrome.\n\n"
+            "SAFETY CHECK:\n"
+            "• Confirm total is $0.00 (or what you expect)\n"
+            "• Finish checkout so items move into your Library\n\n"
+            "When finished, click Continue."
+        )
+
+        if self.stop_flag.is_set():
+            return
+
+        self.log("LIBRARY: opening…")
+        driver.get("https://www.drivethrurpg.com/en/library")
+        self.wait_doc_ready(driver, timeout=25)
+        self.human_sleep(2.5)
+
+        if self.guard_interstitial(driver, "library_after_checkout"):
+            pass
+
+        links = driver.find_elements(By.CSS_SELECTOR, "a[href*='download_file']")
+        self.log(f"LIBRARY: found {len(links)} download links. Clicking first 50…")
+
+        for i, a in enumerate(links[:50], start=1):
+            if self.stop_flag.is_set():
+                return
+            try:
+                self.smart_click(driver, a)
+            except Exception:
+                pass
+            self.human_sleep(2.2)
+            self.set_progress(int((i / max(1, min(50, len(links)))) * 100))
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = DTRPG_Enterprise_System(root)
+    root.mainloop()

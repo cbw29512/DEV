@@ -1,0 +1,47 @@
+# secrets
+.env
+*.key
+*.pem
+
+# python/node junk
+__pycache__/
+*.pyc
+.venv/
+venv/
+node_modules/
+dist/
+build/
+
+# backups + temp
+_nested_git_backups/
+backups/
+*.log
+
+# big binaries / archives (trim upload)
+*.iso
+*.img
+*.qcow2
+*.vmdk
+*.ova
+*.zip
+*.7z
+*.rar
+*.tar
+*.tgz
+*.gz
+*.bz2
+*.xz
+*.exe
+*.msi
+*.deb
+*.rpm
+*.AppImage
+
+# databases (comment out if you WANT these versioned)
+*.db
+*.sqlite
+*.sqlite3
+
+# OS junk
+.DS_Store
+Thumbs.db

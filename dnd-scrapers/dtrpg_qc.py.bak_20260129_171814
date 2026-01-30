@@ -1,0 +1,724 @@
+import os
+import re
+import time
+import shutil
+import hashlib
+import threading
+import subprocess
+import random
+from pathlib import Path
+from queue import Queue, Empty
+
+import tkinter as tk
+from tkinter import ttk, filedialog
+
+import undetected_chromedriver as uc
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.common.exceptions import WebDriverException, TimeoutException
+
+# SELF-HEALING: Prevents crash if plyer is missing
+try:
+    from plyer import notification
+    PLYER_AVAILABLE = True
+except ImportError:
+    PLYER_AVAILABLE = False
+
+# -----------------------------
+# Paths / constants
+# -----------------------------
+USER_HOME = Path(os.environ.get("DTRPG_USER_HOME", str(Path.home())))
+AUTO_PROFILE_PATH = USER_HOME / ".config/google-chrome-automation"
+DEFAULT_STORAGE = USER_HOME / "Documents/DTRPG_QC_Project"
+CHROME_BIN = "/usr/bin/google-chrome-stable"
+
+CART_LIMIT = 50
+CART_URL = "https://www.drivethrurpg.com/cart.php"
+LIBRARY_URL = "https://www.drivethrurpg.com/en/library"
+LOGIN_URL = "https://www.drivethrurpg.com/login.php"
+
+UA_WAIT_MIN = 0.6
+UA_WAIT_RAND = 0.6
+
+
+def detect_chrome_major(default=0) -> int:
+    """Try to detect installed Chrome major version. Falls back to 0 (auto)."""
+    try:
+        out = subprocess.check_output([CHROME_BIN, "--version"], text=True).strip()
+        parts = out.split()
+        for p in parts:
+            if p and p[0].isdigit() and "." in p:
+                return int(p.split(".")[0])
+    except Exception:
+        pass
+    return default
+
+
+def is_invalid_session(exc: Exception) -> bool:
+    s = str(exc).lower()
+    return (
+        "invalid session id" in s
+        or "session deleted because of page crash" in s
+        or "chrome not reachable" in s
+        or "disconnected" in s
+        or "no such window" in s
+        or "target window already closed" in s
+    )
+
+
+def human_pause():
+    time.sleep(UA_WAIT_MIN + random.random() * UA_WAIT_RAND)
+
+
+def page_has_nonzero_money(text: str) -> bool:
+    """If page contains ANY $X.XX where it's not $0.00, treat as non-free."""
+    amounts = re.findall(r"\$[0-9]+(?:\.[0-9]{2})?", text)
+    for a in amounts:
+        if a.strip() != "$0.00":
+            return True
+    return False
+
+
+class DTRPG_Enterprise_System:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("DTRPG Enterprise: Verified Click Edition")
+        self.root.geometry("800x750")
+
+        self.download_path = tk.StringVar(value=str(DEFAULT_STORAGE))
+        self.status_msg = tk.StringVar(value="System Ready")
+        self.progress_val = tk.IntVar(value=0)
+        self.pass_type = tk.StringVar(value="MANUAL")
+
+        # Options
+        self.organize_var = tk.BooleanVar(value=True)
+        self.debug_var = tk.BooleanVar(value=False)
+        self.checkout_to_library_var = tk.BooleanVar(value=True)   # cart -> checkout -> library -> download
+        self.keep_chrome_open_var = tk.BooleanVar(value=True)      # NEW: prevents Chrome closing early
+
+        self.notifications_active = True
+        self.items_carted_attempted = 0
+
+        self.uiq: Queue = Queue()
+
+        self.CATEGORIES = {
+            "Adventures": ["Adventure", "Module", "One-Shot", "Campaign", "Quest"],
+            "Supplements": ["Supplement", "Guide", "Expansion", "Manual", "Rulebook"],
+            "Maps": ["Map", "Battlemap", "Battle Map", "Cartography", "Grid"],
+            "Monsters": ["Monster", "Bestiary", "Creature", "Statblock", "Stat Block"],
+            "Characters": ["Character", "Class", "Subclass", "Race", "Background"],
+        }
+
+        self._build_ui()
+        self.root.after(100, self._drain_ui_queue)
+
+    # -----------------------------
+    # UI helpers
+    # -----------------------------
+    def _drain_ui_queue(self):
+        try:
+            while True:
+                fn = self.uiq.get_nowait()
+                try:
+                    fn()
+                except Exception:
+                    pass
+        except Empty:
+            pass
+        self.root.after(100, self._drain_ui_queue)
+
+    def ui(self, fn):
+        self.uiq.put(fn)
+
+    def log(self, message: str):
+        ts = time.strftime("%H:%M:%S")
+        def _do():
+            self.log_box.insert(tk.END, f"[{ts}] {message}")
+            self.log_box.see(tk.END)
+        self.ui(_do)
+
+    def set_progress(self, pct: int):
+        self.ui(lambda: self.progress_val.set(pct))
+
+    def set_status(self, s: str):
+        self.ui(lambda: self.status_msg.set(s))
+
+    def blocking_modal(self, title: str, msg: str, button_text="Continue"):
+        """BLOCKING modal dialog (won't hide behind Chrome)."""
+        gate = threading.Event()
+
+        def _do():
+            try:
+                self.root.deiconify()
+                self.root.lift()
+                self.root.focus_force()
+                self.root.attributes("-topmost", True)
+                self.root.after(250, lambda: self.root.attributes("-topmost", False))
+            except Exception:
+                pass
+
+            win = tk.Toplevel(self.root)
+            win.title(title)
+            win.transient(self.root)
+            win.grab_set()
+            try:
+                win.attributes("-topmost", True)
+            except Exception:
+                pass
+
+            frm = ttk.Frame(win, padding=16)
+            frm.pack(fill="both", expand=True)
+
+            lbl = ttk.Label(frm, text=msg, justify="left", wraplength=640)
+            lbl.pack(fill="both", expand=True)
+
+            def close():
+                try:
+                    win.grab_release()
+                except Exception:
+                    pass
+                try:
+                    win.destroy()
+                except Exception:
+                    pass
+                gate.set()
+
+            btn = ttk.Button(frm, text=button_text, command=close)
+            btn.pack(pady=(12, 0))
+            win.protocol("WM_DELETE_WINDOW", close)
+
+            win.update_idletasks()
+            x = self.root.winfo_rootx() + (self.root.winfo_width() // 2) - (win.winfo_width() // 2)
+            y = self.root.winfo_rooty() + (self.root.winfo_height() // 2) - (win.winfo_height() // 2)
+            win.geometry(f"+{max(0, x)}+{max(0, y)}")
+            btn.focus_set()
+
+        self.ui(_do)
+        gate.wait()
+
+    # -----------------------------
+    # UI layout (buttons always visible)
+    # -----------------------------
+    def _build_ui(self):
+        frame_pass = ttk.LabelFrame(self.root, text="Acquisition Strategy", padding=10)
+        frame_pass.pack(fill="x", padx=10, pady=5)
+
+        ttk.Radiobutton(
+            frame_pass, text="Mode A: Manual Filter (Acquire New)",
+            variable=self.pass_type, value="MANUAL"
+        ).pack(side="left", padx=10)
+
+        ttk.Radiobutton(
+            frame_pass, text="Mode B: Library Auto-Download",
+            variable=self.pass_type, value="SYNC"
+        ).pack(side="left", padx=10)
+
+        frame_opts = ttk.LabelFrame(self.root, text="Options", padding=10)
+        frame_opts.pack(fill="x", padx=10, pady=5)
+
+        ttk.Checkbutton(frame_opts, text="Organize downloads into category folders (optional)",
+                        variable=self.organize_var).pack(side="left", padx=10)
+        ttk.Checkbutton(frame_opts, text="Create _debug dumps on failures",
+                        variable=self.debug_var).pack(side="left", padx=10)
+        ttk.Checkbutton(frame_opts, text="After carting, move items to Library (checkout $0 + auto-download)",
+                        variable=self.checkout_to_library_var).pack(side="left", padx=10)
+        ttk.Checkbutton(frame_opts, text="Keep Chrome open until I click Continue (prevents early close)",
+                        variable=self.keep_chrome_open_var).pack(side="left", padx=10)
+
+        frame_dir = ttk.LabelFrame(self.root, text="Local Database Storage Path", padding=10)
+        frame_dir.pack(fill="x", padx=10, pady=5)
+        ttk.Entry(frame_dir, textvariable=self.download_path).pack(side="left", fill="x", expand=True)
+        ttk.Button(frame_dir, text="Browse", command=self._browse_dir).pack(side="right")
+
+        frame_prog = ttk.LabelFrame(self.root, text="Mission Execution", padding=10)
+        frame_prog.pack(fill="x", padx=10, pady=5)
+        ttk.Progressbar(frame_prog, variable=self.progress_val, maximum=100).pack(fill="x", pady=5)
+        ttk.Label(frame_prog, textvariable=self.status_msg).pack()
+
+        self.log_box = tk.Listbox(self.root, height=18, bg="#000000", fg="#00FF00", font=("Courier", 10))
+        self.log_box.pack(fill="both", expand=True, padx=10, pady=5)
+
+        bar = ttk.Frame(self.root, padding=(10, 0, 10, 10))
+        bar.pack(side="bottom", fill="x")
+
+        self.start_btn = ttk.Button(bar, text="LAUNCH AUTOMATION", command=self.start_thread)
+        self.start_btn.pack(side="left")
+
+        ttk.Button(bar, text="Quit", command=self.root.destroy).pack(side="right")
+
+    def _browse_dir(self):
+        d = filedialog.askdirectory()
+        if d:
+            self.download_path.set(d)
+
+    # -----------------------------
+    # Notifications
+    # -----------------------------
+    def send_notification(self, title, message):
+        if PLYER_AVAILABLE and self.notifications_active:
+            try:
+                notification.notify(title=title, message=message, app_name="DTRPG Watchdog", timeout=5)
+            except Exception as e:
+                self.notifications_active = False
+                self.log(f"WARN: Notify failed. Disabling. ({str(e)})")
+        else:
+            self.log(f"NOTIFY: {title} - {message}")
+
+    # -----------------------------
+    # Debug dump
+    # -----------------------------
+    def debug_dump(self, driver, tag: str):
+        if not self.debug_var.get():
+            return
+        try:
+            dbg = Path(self.download_path.get()) / "_debug"
+            dbg.mkdir(parents=True, exist_ok=True)
+            driver.save_screenshot(str(dbg / f"{tag}.png"))
+            (dbg / f"{tag}.html").write_text(driver.page_source, encoding="utf-8", errors="replace")
+            (dbg / f"{tag}.url.txt").write_text(driver.current_url, encoding="utf-8", errors="replace")
+            self.log(f"DEBUG: Dumped {tag} -> {dbg}")
+        except Exception as e:
+            if is_invalid_session(e):
+                self.log("DEBUG: dump skipped (session invalid).")
+            else:
+                self.log(f"DEBUG: dump failed: {e}")
+
+    # -----------------------------
+    # File post-processing
+    # -----------------------------
+    def get_file_hash(self, path: Path) -> str:
+        hasher = hashlib.md5()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+
+    def post_process_files(self):
+        base = Path(self.download_path.get())
+        if not base.exists():
+            return
+
+        self.log("POST-PROCESS: Deduping + Indexing...")
+        seen_hashes = {}
+        for root, _, files in os.walk(base):
+            rootp = Path(root)
+            if rootp.name == "_debug":
+                continue
+            for name in files:
+                if name.endswith(".crdownload") or name == "search_index.txt":
+                    continue
+                p = rootp / name
+                try:
+                    h = self.get_file_hash(p)
+                    if h in seen_hashes:
+                        p.unlink(missing_ok=True)
+                    else:
+                        seen_hashes[h] = str(p)
+                except Exception:
+                    continue
+
+        if self.organize_var.get():
+            self.log("POST-PROCESS: Organizing into categories...")
+            for p in list(base.iterdir()):
+                if not p.is_file():
+                    continue
+                if p.name == "search_index.txt" or p.name.endswith(".crdownload"):
+                    continue
+
+                moved = False
+                for cat, keys in self.CATEGORIES.items():
+                    if any(k.lower() in p.name.lower() for k in keys):
+                        dst = base / cat
+                        dst.mkdir(parents=True, exist_ok=True)
+                        try:
+                            shutil.move(str(p), str(dst / p.name))
+                            moved = True
+                        except Exception:
+                            pass
+                        break
+                if not moved:
+                    dst = base / "Unsorted"
+                    dst.mkdir(parents=True, exist_ok=True)
+                    try:
+                        shutil.move(str(p), str(dst / p.name))
+                    except Exception:
+                        pass
+
+        index_lines = []
+        for root, _, files in os.walk(base):
+            rootp = Path(root)
+            if rootp.name == "_debug":
+                continue
+            for name in files:
+                if name == "search_index.txt" or name.endswith(".crdownload"):
+                    continue
+                p = rootp / name
+                rel = p.relative_to(base)
+                index_lines.append(f"{rel} | {p.parent.name}\n")
+
+        (base / "search_index.txt").write_text("".join(index_lines), encoding="utf-8", errors="replace")
+        self.log("POST-PROCESS: Local Search Index Updated.")
+
+    # -----------------------------
+    # Click helpers
+    # -----------------------------
+    def smart_click(self, driver, element):
+        try:
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
+            time.sleep(0.15)
+        except Exception:
+            pass
+
+        try:
+            element.click()
+            return "native"
+        except Exception:
+            pass
+
+        try:
+            ActionChains(driver).move_to_element(element).pause(0.1).click(element).perform()
+            return "actions"
+        except Exception:
+            pass
+
+        driver.execute_script("arguments[0].click();", element)
+        return "js"
+
+    def click_by_text(self, driver, phrases, timeout=8):
+        for phrase in phrases:
+            p = phrase.lower()
+            xpath_candidates = [
+                f"//button[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'{p}')]",
+                f"//a[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'{p}')]",
+                f"//input[@type='submit' and contains(translate(@value,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'{p}')]",
+                f"//input[@type='button' and contains(translate(@value,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'{p}')]",
+            ]
+            for xp in xpath_candidates:
+                try:
+                    el = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable((By.XPATH, xp)))
+                    m = self.smart_click(driver, el)
+                    self.log(f"CLICK: '{phrase}' ({m})")
+                    return True
+                except Exception:
+                    continue
+        return False
+
+    # -----------------------------
+    # Thread runner
+    # -----------------------------
+    def start_thread(self):
+        Path(self.download_path.get()).mkdir(parents=True, exist_ok=True)
+        AUTO_PROFILE_PATH.mkdir(parents=True, exist_ok=True)
+        self.start_btn.config(state="disabled")
+        threading.Thread(target=self.run_process, daemon=True).start()
+
+    def run_process(self):
+        driver = None
+        current_pass = self.pass_type.get()
+        self.items_carted_attempted = 0
+        err = None
+
+        try:
+            self.log(f"SYSTEM: Spawning {current_pass} mission...")
+            self.set_status("Starting Chrome...")
+
+            if not Path(CHROME_BIN).exists():
+                raise RuntimeError(f"Chrome binary not found: {CHROME_BIN}")
+
+            options = uc.ChromeOptions()
+            options.add_argument("--disable-popup-blocking")
+            options.add_argument(f"--user-data-dir={str(AUTO_PROFILE_PATH)}")
+            options.add_argument("--password-store=basic")
+
+            prefs = {
+                "download.default_directory": self.download_path.get(),
+                "download.prompt_for_download": False,
+                "plugins.always_open_pdf_externally": True,
+                "profile.default_content_setting_values.popups": 1,
+                "profile.managed_default_content_settings.popups": 1,
+            }
+            options.add_experimental_option("prefs", prefs)
+
+            chrome_major = detect_chrome_major(default=0)
+            kwargs = {"version_main": chrome_major} if chrome_major > 0 else {}
+
+            driver = uc.Chrome(
+                options=options,
+                browser_executable_path=CHROME_BIN,
+                port=0,
+                **kwargs,
+            )
+            wait = WebDriverWait(driver, 25)
+
+            driver.get(LOGIN_URL)
+            self.set_status("AWAITING LOGIN...")
+
+            if current_pass == "SYNC":
+                self.log("ACTION: Login in Chrome, then click Continue...")
+                self.blocking_modal(
+                    "Login Required",
+                    "1) Login in the Chrome window.\n"
+                    "2) Confirm you're logged in.\n"
+                    "3) Click Continue here.\n\n"
+                    "Then the bot will open your Library and begin downloading."
+                )
+                self.set_status("SYNC: Opening Library...")
+                self.sync_library(driver, wait)
+            else:
+                self.log("ACTION: Login + navigate to filtered results page (BLOCKING)...")
+                self.blocking_modal(
+                    "Ready to Scrape",
+                    "1) Login in the Chrome window.\n"
+                    "2) Navigate to the EXACT filtered results page to scrape.\n"
+                    "3) Click Continue here.\n\n"
+                    "The bot will NOT start until you click Continue."
+                )
+                self.set_status("RUNNING: Acquiring...")
+                self.acquire_content_manual(driver, wait)
+
+                if self.checkout_to_library_var.get() and self.items_carted_attempted > 0:
+                    self.set_status("CHECKOUT: Moving to Library...")
+                    ok = self.checkout_zero_cart_into_library(driver, wait)
+                    if ok:
+                        self.set_status("DOWNLOADING: Library sync...")
+                        self.sync_library(driver, wait)
+
+        except Exception as e:
+            err = e
+            self.log(f"CRITICAL: {str(e)}")
+            if driver:
+                self.debug_dump(driver, "critical_exception")
+
+        finally:
+            try:
+                self.post_process_files()
+            except Exception:
+                pass
+
+            self.send_notification("Mission Complete", f"{current_pass} pass finished.")
+            self.set_status("Complete")
+
+            # NEW: do NOT close Chrome until YOU click Continue (prevents early close)
+            if driver and self.keep_chrome_open_var.get():
+                msg = "Chrome will stay open so you can click site popups / finish checkout.\n\n"
+                if err:
+                    msg += f"Run ended with an error:\n{err}\n\n"
+                msg += "When you are completely done in Chrome, click Continue and I will close Chrome."
+                self.blocking_modal("Chrome Hold", msg, button_text="Continue (close Chrome)")
+
+            if driver:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+
+            self.ui(lambda: self.start_btn.config(state="normal"))
+
+    # -----------------------------
+    # Mode B: Sync
+    # -----------------------------
+    def sync_library(self, driver, wait):
+        self.log("NAVIGATE: Accessing Digital Library...")
+        driver.get(LIBRARY_URL)
+        time.sleep(6)
+
+        existing_files = []
+        for root, _, files in os.walk(self.download_path.get()):
+            existing_files.extend([f.lower() for f in files])
+
+        links = wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "a[href*='download_file']")))
+
+        to_download = []
+        for link in links:
+            title = link.get_attribute("title") or link.text
+            clean_title = title.replace("Download ", "").strip()
+            if clean_title.lower() not in existing_files:
+                to_download.append(link)
+
+        self.log(f"SYNC: Found {len(to_download)} new items.")
+        if to_download:
+            self.send_notification("Update Found", f"Fetching {len(to_download)} new books.")
+
+        for i, link in enumerate(to_download):
+            try:
+                self.log(f"  - Fetching: {link.text}")
+                link.click()
+                time.sleep(4)
+                self.set_progress(int(((i + 1) / max(1, len(to_download))) * 100))
+            except Exception:
+                continue
+
+    # -----------------------------
+    # Mode A: Acquire
+    # -----------------------------
+    def acquire_content_manual(self, driver, wait):
+        self.log("ACQUIRE: Scanning your filtered page...")
+        list_url = driver.current_url
+
+        wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        links = wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "a[href*='/product/']")))
+
+        urls = []
+        for l in links:
+            href = l.get_attribute("href")
+            if href and "/product/" in href:
+                urls.append(href)
+        urls = list(dict.fromkeys(urls))
+
+        self.log(f"BATCH: Processing {len(urls)} items.")
+
+        for i, url in enumerate(urls):
+            if self.items_carted_attempted >= CART_LIMIT:
+                self.log("CART LIMIT: reached 50 attempted adds.")
+                self.blocking_modal("Cart Limit", "Reached 50 adds. Click Continue to proceed to $0 checkout -> Library.")
+                break
+
+            step = "precheck"
+            try:
+                try:
+                    _ = driver.current_url
+                except Exception as e:
+                    if is_invalid_session(e):
+                        self.log("CRITICAL: Browser session died. Stopping run.")
+                        break
+
+                step = "load_product"
+                driver.get(url)
+                wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+                human_pause()
+
+                step = "detect_price"
+                price_box = None
+                for sel in ["pwyw_price", "pwyw_amount", "amount", "price"]:
+                    try:
+                        field = driver.find_element(By.ID, sel)
+                        if field.is_displayed():
+                            price_box = field
+                            break
+                    except Exception:
+                        continue
+
+                added_attempted = False
+                btn_sel = (By.CSS_SELECTOR, "input[type='submit'][value*='Cart'], button[type='submit']")
+
+                step = "click_logic"
+                if price_box:
+                    price_box.clear()
+                    price_box.send_keys("0")
+                    btn = wait.until(EC.presence_of_element_located(btn_sel))
+                    m = self.smart_click(driver, btn)
+                    added_attempted = True
+                    self.log(f"PWYW add-to-cart attempted ({m}): {url.split('/')[-1]}")
+                else:
+                    page_text = driver.find_element(By.TAG_NAME, "body").text
+                    if "Free" in page_text or "$0.00" in page_text:
+                        btn = wait.until(EC.presence_of_element_located(btn_sel))
+                        m = self.smart_click(driver, btn)
+                        added_attempted = True
+                        self.log(f"FREE add-to-cart attempted ({m}): {url.split('/')[-1]}")
+
+                if added_attempted:
+                    self.items_carted_attempted += 1
+
+                step = "return_to_list"
+                driver.get(list_url)
+                wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+                human_pause()
+
+            except (WebDriverException, TimeoutException) as e:
+                if is_invalid_session(e):
+                    self.log(f"CRITICAL: invalid session at step={step}. Stopping run.")
+                    break
+                self.log(f"WARN: item failed at step={step}: {e}")
+                self.debug_dump(driver, f"item_fail_{i}_{step}")
+
+            except Exception as e:
+                if is_invalid_session(e):
+                    self.log(f"CRITICAL: invalid session at step={step}. Stopping run.")
+                    break
+                self.log(f"WARN: item failed at step={step}: {e}")
+                self.debug_dump(driver, f"item_fail_{i}_{step}")
+
+            self.set_progress(int(((i + 1) / max(1, len(urls))) * 100))
+
+    # -----------------------------
+    # Checkout: Cart -> Library
+    # -----------------------------
+    def checkout_zero_cart_into_library(self, driver, wait) -> bool:
+        try:
+            self.log("CHECKOUT: Opening cart...")
+            driver.get(CART_URL)
+            wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+            human_pause()
+
+            body_text = driver.find_element(By.TAG_NAME, "body").text
+            if page_has_nonzero_money(body_text):
+                self.log("CHECKOUT: Cart contains non-$0.00 amounts. Stopping for safety.")
+                self.blocking_modal(
+                    "Checkout Safety Stop",
+                    "Cart appears to contain non-$0.00 items.\n\n"
+                    "Remove paid items manually, then re-run."
+                )
+                return False
+
+            clicked = self.click_by_text(driver, [
+                "proceed to checkout",
+                "checkout",
+                "secure checkout",
+            ], timeout=8)
+
+            if not clicked:
+                self.blocking_modal(
+                    "Manual Checkout Needed",
+                    "I opened your cart.\n\n"
+                    "In the Chrome window:\n"
+                    "1) Click Checkout\n"
+                    "2) Proceed to the final confirmation\n"
+                    "3) Complete the $0 order\n\n"
+                    "When you see an order confirmation/receipt page, click Continue."
+                )
+                return True
+
+            human_pause()
+            wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+
+            body_text2 = driver.find_element(By.TAG_NAME, "body").text
+            if page_has_nonzero_money(body_text2):
+                self.log("CHECKOUT: Non-$0.00 detected after checkout navigation. Stopping.")
+                self.blocking_modal(
+                    "Checkout Safety Stop",
+                    "The checkout page appears to include a non-$0.00 amount.\n\n"
+                    "Stopping for safety. Complete manually if intended."
+                )
+                return False
+
+            # Let user finalize the last click safely
+            self.blocking_modal(
+                "Finalize $0 Checkout",
+                "In the Chrome window, complete the final $0 checkout step.\n\n"
+                "Click the final confirmation button (Place Order / Complete Order / Confirm).\n"
+                "When you see an order confirmation/receipt page, click Continue."
+            )
+
+            self.log("CHECKOUT: User confirmed completion. Proceeding to Library.")
+            return True
+
+        except Exception as e:
+            if is_invalid_session(e):
+                self.log("CHECKOUT: Browser session died during checkout.")
+                return False
+            self.log(f"CHECKOUT: Failed: {e}")
+            self.debug_dump(driver, "checkout_failed")
+            return False
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = DTRPG_Enterprise_System(root)
+    root.mainloop()
+PY
+
+python -m py_compile dtrpg_qc.py && echo "✅ Syntax OK"
+python dtrpg_qc.py

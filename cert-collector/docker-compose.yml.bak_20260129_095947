@@ -1,0 +1,13 @@
+services:
+  collector:
+    build: ./app
+    network_mode: host
+    user: "${UID:-1000}:${GID:-1000}"
+    volumes:
+      - ./data:/data
+      - ./library:/library
+      - ./policies:/policies:ro
+    environment:
+      - DB_PATH=/data/collector.db
+      - LIBRARY_ROOT=/library/store
+      - POLICIES_PATH=/policies/policies.yml

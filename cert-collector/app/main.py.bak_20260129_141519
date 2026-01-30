@@ -1,0 +1,183 @@
+import os, re, sqlite3, hashlib, pathlib, time
+import yaml, requests
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware, HTTPException
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+
+DB_PATH = os.getenv("DB_PATH", "/data/collector.db")
+LIBRARY_ROOT = os.getenv("LIBRARY_ROOT", "/library/store")
+POLICIES_PATH = os.getenv("POLICIES_PATH", "/policies/policies.yml")
+
+app = FastAPI(title="Local Cert Collector")
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+class AddURL(BaseModel):
+    url: str
+    vendor: str = "unknown"
+    exam: str = "unknown"
+
+def load_policies():
+    with open(POLICIES_PATH, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+def db():
+    con = sqlite3.connect(DB_PATH)
+    con.execute("""
+      CREATE TABLE IF NOT EXISTS candidates(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        url TEXT UNIQUE,
+        vendor TEXT,
+        exam TEXT,
+        status TEXT,
+        reason TEXT,
+        sha256 TEXT,
+        saved_path TEXT,
+        created_ts INTEGER
+      )
+    """)
+    con.commit()
+    return con
+
+def sha256_bytes(b: bytes) -> str:
+    h = hashlib.sha256()
+    h.update(b)
+    return h.hexdigest()
+
+def normalize_filename(name: str) -> str:
+    name = name.strip() or "download.pdf"
+    return re.sub(r"[^a-zA-Z0-9._-]+", "_", name)
+
+def page_license_verdict(html: str, policies: dict) -> tuple[str, str]:
+    text = html.lower()
+
+    for bad in policies.get("blocked_markers", []):
+        if bad.lower() in text:
+            return ("needs_review", f"blocked_marker:{bad}")
+
+    for ok in policies.get("allowed_license_markers", []):
+        if ok.lower() in text:
+            return ("downloadable", f"allowed_marker:{ok}")
+
+    return ("needs_review", "license_unclear")
+
+def detect_content_type(url: str) -> str:
+    try:
+        head = requests.head(url, timeout=15, allow_redirects=True)
+        return (head.headers.get("content-type","") or "").lower()
+    except Exception:
+        return ""
+
+def download_pdf(url: str, vendor: str, exam: str) -> tuple[str, str]:
+    r = requests.get(url, timeout=45, allow_redirects=True)
+    r.raise_for_status()
+
+    ct = (r.headers.get("content-type","") or "").lower()
+    if "application/pdf" not in ct and not url.lower().endswith(".pdf"):
+        raise HTTPException(400, f"Not a PDF (content-type={ct})")
+
+    b = r.content
+    digest = sha256_bytes(b)
+
+    outdir = pathlib.Path(LIBRARY_ROOT) / vendor / exam
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    leaf = url.split("?")[0].split("#")[0].rstrip("/").split("/")[-1]
+    fname = normalize_filename(leaf if leaf else "download.pdf")
+    if not fname.lower().endswith(".pdf"):
+        fname += ".pdf"
+
+    outpath = outdir / fname
+    outpath.write_bytes(b)
+    return digest, str(outpath)
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    p = pathlib.Path(__file__).parent / "static" / "index.html"
+    return p.read_text(encoding="utf-8", errors="replace")
+
+@app.get("/api/health")
+def health():
+    return {"ok": True}
+
+@app.post("/api/add")
+def add(item: AddURL):
+    con = db()
+    policies = load_policies()
+
+    url = item.url.strip()
+    vendor = (item.vendor or "unknown").strip() or "unknown"
+    exam = (item.exam or "unknown").strip() or "unknown"
+
+    ct = detect_content_type(url)
+
+    status = "needs_review"
+    reason = "license_unclear"
+
+    # If it's HTML, we can scan for license markers.
+    if "text/html" in ct or (ct == "" and not url.lower().endswith(".pdf")):
+        try:
+            r = requests.get(url, timeout=30, allow_redirects=True)
+            r.raise_for_status()
+            status, reason = page_license_verdict(r.text, policies)
+        except Exception as e:
+            status, reason = "needs_review", f"fetch_failed:{type(e).__name__}"
+    else:
+        # Direct file links generally lack license context
+        status, reason = "needs_review", "direct_file_no_license_context"
+
+    con.execute(
+        "INSERT OR IGNORE INTO candidates(url,vendor,exam,status,reason,created_ts) VALUES(?,?,?,?,?,?)",
+        (url, vendor, exam, status, reason, int(time.time()))
+    )
+    con.commit()
+    return {"ok": True, "status": status, "reason": reason}
+
+@app.post("/api/approve_download")
+def approve_download(item: AddURL):
+    con = db()
+    url = item.url.strip()
+    vendor = (item.vendor or "unknown").strip() or "unknown"
+    exam = (item.exam or "unknown").strip() or "unknown"
+
+    digest, path = download_pdf(url, vendor, exam)
+
+    con.execute("""
+      UPDATE candidates
+      SET vendor=?, exam=?, status='downloaded', reason='user_approved', sha256=?, saved_path=?
+      WHERE url=?
+    """, (vendor, exam, digest, path, url))
+    if con.total_changes == 0:
+        con.execute("""
+          INSERT OR IGNORE INTO candidates(url,vendor,exam,status,reason,sha256,saved_path,created_ts)
+          VALUES(?,?,?,?,?,?,?,?)
+        """, (url, vendor, exam, "downloaded", "user_approved", digest, path, int(time.time())))
+
+    con.commit()
+    return {"ok": True, "sha256": digest, "saved_path": path}
+
+@app.get("/api/list")
+def list_all():
+    con = db()
+    rows = con.execute("""
+      SELECT id,url,vendor,exam,status,reason,sha256,saved_path,created_ts
+      FROM candidates
+      ORDER BY created_ts DESC
+    """).fetchall()
+
+    return {"items": [
+        {"id":r[0],"url":r[1],"vendor":r[2],"exam":r[3],"status":r[4],
+         "reason":r[5],"sha256":r[6],"saved_path":r[7],"created_ts":r[8]}
+        for r in rows
+    ]}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8080)

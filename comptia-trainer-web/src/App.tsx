@@ -1,0 +1,186 @@
+import { useEffect, useMemo, useState } from "react";
+import "./App.css";
+import { apiAdd, apiHealth, apiList } from "./api";
+import type { CollectorItem } from "./api";
+
+function fmtTs(ts: number) {
+  try {
+    return new Date(ts * 1000).toLocaleString();
+  } catch {
+    return String(ts);
+  }
+}
+
+export default function App() {
+  const [apiOk, setApiOk] = useState<boolean | null>(null);
+  const [items, setItems] = useState<CollectorItem[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string>("");
+
+  const [url, setUrl] = useState("https://example.com");
+  const [vendor, setVendor] = useState("comptia");
+  const [exam, setExam] = useState("SY0-701");
+
+  const counts = useMemo(() => {
+    const byStatus: Record<string, number> = {};
+    for (const it of items) byStatus[it.status] = (byStatus[it.status] || 0) + 1;
+    return byStatus;
+  }, [items]);
+
+  async function refresh() {
+    setErr("");
+    setLoading(true);
+    try {
+      const h = await apiHealth();
+      setApiOk(!!h.ok);
+
+      const data = await apiList();
+      setItems(data.items || []);
+    } catch (e: any) {
+      setApiOk(false);
+      setErr(e?.message || String(e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function onAdd(e: React.FormEvent) {
+    e.preventDefault();
+    setErr("");
+    try {
+      const out = await apiAdd({ url, vendor, exam });
+      await refresh();
+      alert(`Added: ${out?.status || "ok"}${out?.reason ? " — " + out.reason : ""}`);
+    } catch (e: any) {
+      setErr(e?.message || String(e));
+    }
+  }
+
+  useEffect(() => {
+    refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  return (
+    <div style={{ maxWidth: 1100, margin: "0 auto", padding: 18 }}>
+      <h1 style={{ marginBottom: 6 }}>Cert Collector</h1>
+
+      <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 16 }}>
+        <span>
+          API:{" "}
+          {apiOk === null ? (
+            <b>checking…</b>
+          ) : apiOk ? (
+            <b style={{ color: "green" }}>OK</b>
+          ) : (
+            <b style={{ color: "red" }}>DOWN</b>
+          )}
+        </span>
+
+        <button onClick={refresh} disabled={loading} style={{ padding: "6px 10px" }}>
+          {loading ? "Refreshing…" : "Refresh"}
+        </button>
+
+        <span style={{ opacity: 0.8 }}>
+          Total: <b>{items.length}</b>
+          {Object.keys(counts).length ? (
+            <>
+              {" "}
+              |{" "}
+              {Object.entries(counts)
+                .map(([k, v]) => `${k}:${v}`)
+                .join("  •  ")}
+            </>
+          ) : null}
+        </span>
+      </div>
+
+      {err ? (
+        <div
+          style={{
+            background: "#2a0f0f",
+            border: "1px solid #5a1f1f",
+            padding: 12,
+            borderRadius: 8,
+            marginBottom: 16,
+            whiteSpace: "pre-wrap",
+          }}
+        >
+          <b>Error:</b> {err}
+        </div>
+      ) : null}
+
+      <form
+        onSubmit={onAdd}
+        style={{
+          display: "grid",
+          gridTemplateColumns: "1fr 160px 160px 120px",
+          gap: 10,
+          marginBottom: 18,
+        }}
+      >
+        <input
+          value={url}
+          onChange={(e) => setUrl(e.target.value)}
+          placeholder="URL to add (PDF or landing page)"
+          style={{ padding: 10 }}
+        />
+        <input value={vendor} onChange={(e) => setVendor(e.target.value)} placeholder="vendor" style={{ padding: 10 }} />
+        <input value={exam} onChange={(e) => setExam(e.target.value)} placeholder="exam" style={{ padding: 10 }} />
+        <button type="submit" style={{ padding: "10px 12px" }}>
+          Add
+        </button>
+      </form>
+
+      <div style={{ border: "1px solid #333", borderRadius: 10, overflow: "hidden" }}>
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "70px 1fr 140px 140px 140px 220px",
+            background: "#111",
+            padding: 10,
+            fontWeight: 700,
+          }}
+        >
+          <div>ID</div>
+          <div>URL</div>
+          <div>Vendor</div>
+          <div>Exam</div>
+          <div>Status</div>
+          <div>Created</div>
+        </div>
+
+        {items.length === 0 ? (
+          <div style={{ padding: 14, opacity: 0.8 }}>No items yet. Add one above.</div>
+        ) : (
+          items
+            .slice()
+            .reverse()
+            .map((it) => (
+              <div
+                key={it.id}
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "70px 1fr 140px 140px 140px 220px",
+                  padding: 10,
+                  borderTop: "1px solid #222",
+                }}
+              >
+                <div>{it.id}</div>
+                <div style={{ overflow: "hidden" }} title={it.url}>
+                  <a href={it.url} target="_blank" rel="noreferrer">
+                    {it.url}
+                  </a>
+                  {it.reason ? <div style={{ fontSize: 12, opacity: 0.8 }}>reason: {it.reason}</div> : null}
+                </div>
+                <div>{it.vendor}</div>
+                <div>{it.exam}</div>
+                <div>{it.status}</div>
+                <div>{fmtTs(it.created_ts)}</div>
+              </div>
+            ))
+        )}
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,10 @@
+allowed_license_markers:
+  - "creativecommons.org/licenses/"
+  - "creativecommons.org/publicdomain/"
+  - "CC0"
+  - "Public Domain"
+  - "No known copyright restrictions"
+  - "Free to Use and Reuse"
+blocked_markers:
+  - "all rights reserved"
+  - "copyright ©"

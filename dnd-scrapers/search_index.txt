@@ -1,0 +1,195 @@
+import os
+import time
+import shutil
+import hashlib
+import threading
+import tkinter as tk
+from tkinter import ttk, filedialog
+import undetected_chromedriver as uc
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+# --- SYSTEM PATHS ---
+USER_HOME = os.path.expanduser("~")
+CHROME_PROFILE_PATH = os.path.join(USER_HOME, ".config/google-chrome")
+DEFAULT_STORAGE = os.path.join(USER_HOME, "Documents/DTRPG_QC_Project")
+POSSIBLE_CHROME_BINARIES = [
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/chromium-browser'
+]
+
+class DTRPG_Local_Search_System:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("DriveThruRPG Local Search & Acquisition")
+        self.root.geometry("800x650")
+        
+        self.download_path = tk.StringVar(value=DEFAULT_STORAGE)
+        self.status_msg = tk.StringVar(value="System Standing By")
+        self.progress_val = tk.IntVar(value=0)
+        
+        self.CATEGORIES = {
+            "Adventures": ["Adventure", "Module", "One-Shot", "Campaign", "Quest"],
+            "Supplements": ["Supplement", "Guide", "Expansion", "Manual", "Rulebook"],
+            "Maps": ["Map", "Battlemap", "Cartography", "Grid"],
+            "Monsters": ["Monster", "Bestiary", "Creature", "Statblock"],
+            "Characters": ["Character", "Class", "Subclass", "Race", "Background"]
+        }
+        
+        self.setup_ui()
+
+    def setup_ui(self):
+        # Path Configuration
+        frame_dir = ttk.LabelFrame(self.root, text="Local Storage Path (D&D AI Index)", padding=10)
+        frame_dir.pack(fill="x", padx=10, pady=5)
+        ttk.Entry(frame_dir, textvariable=self.download_path).pack(side="left", fill="x", expand=True)
+        ttk.Button(frame_dir, text="Browse", command=lambda: self.download_path.set(filedialog.askdirectory())).pack(side="right")
+
+        # Status
+        frame_prog = ttk.LabelFrame(self.root, text="Operation Status", padding=10)
+        frame_prog.pack(fill="x", padx=10, pady=5)
+        self.progress_bar = ttk.Progressbar(frame_prog, variable=self.progress_val, maximum=100)
+        self.progress_bar.pack(fill="x", pady=5)
+        ttk.Label(frame_prog, textvariable=self.status_msg).pack()
+
+        # Terminal Log
+        self.log_box = tk.Listbox(self.root, height=15, bg="#0d0d0d", fg="#00ff41", font=("Courier", 10))
+        self.log_box.pack(fill="both", expand=True, padx=10, pady=5)
+
+        # Controls
+        btn_frame = ttk.Frame(self.root)
+        btn_frame.pack(pady=10)
+        self.start_btn = ttk.Button(btn_frame, text="RUN FULL ACQUISITION", command=self.start_thread)
+        self.start_btn.pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="INDEX LOCAL FILES", command=self.update_search_index).pack(side="left", padx=5)
+
+    def log(self, message):
+        self.log_box.insert(tk.END, f"[{time.strftime('%H:%M:%S')}] {message}")
+        self.log_box.see(tk.END)
+
+    def update_search_index(self):
+        """Creates a local index for instant file searching across categories."""
+        base = self.download_path.get()
+        index_file = os.path.join(base, "search_index.txt")
+        self.log("Indexing local files for easy searching...")
+        
+        try:
+            with open(index_file, "w") as f:
+                for root, dirs, files in os.walk(base):
+                    for name in files:
+                        if name != "search_index.txt":
+                            rel_path = os.path.relpath(os.path.join(root, name), base)
+                            f.write(f"{name} | LOCATION: {rel_path}\n")
+            self.log(f"Search index updated at: {index_file}")
+        except Exception as e:
+            self.log(f"Index Error: {e}")
+
+    def get_file_hash(self, path):
+        hasher = hashlib.md5()
+        with open(path, 'rb') as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+
+    def organize_and_dedupe(self):
+        base = self.download_path.get()
+        seen_hashes = {}
+        
+        # 1. Deduplication
+        for root, dirs, files in os.walk(base):
+            for filename in files:
+                f_path = os.path.join(root, filename)
+                h = self.get_file_hash(f_path)
+                if h in seen_hashes:
+                    os.remove(f_path)
+                    self.log(f"CLEANUP: Duplicate deleted - {filename}")
+                else:
+                    seen_hashes[h] = f_path
+
+        # 2. Categorization
+        for filename in [f for f in os.listdir(base) if os.path.isfile(os.path.join(base, f))]:
+            src = os.path.join(base, filename)
+            moved = False
+            for cat, keywords in self.CATEGORIES.items():
+                if any(k.lower() in filename.lower() for k in keywords):
+                    dest_dir = os.path.join(base, cat)
+                    os.makedirs(dest_dir, exist_ok=True)
+                    shutil.move(src, os.path.join(dest_dir, filename))
+                    moved = True
+                    break
+            if not moved:
+                unsorted = os.path.join(base, "Unsorted")
+                os.makedirs(unsorted, exist_ok=True)
+                shutil.move(src, os.path.join(unsorted, filename))
+        
+        # 3. Final Search Indexing
+        self.update_search_index()
+
+    def start_thread(self):
+        self.start_btn.config(state="disabled")
+        threading.Thread(target=self.run_process, daemon=True).start()
+
+    def run_process(self):
+        chrome_bin = next((p for p in POSSIBLE_CHROME_BINARIES if os.path.exists(p)), None)
+        if not chrome_bin:
+            self.log("FATAL: Google Chrome not found.")
+            return
+
+        options = uc.ChromeOptions()
+        options.add_argument(f"--user-data-dir={CHROME_PROFILE_PATH}")
+        options.add_argument("--profile-directory=Default")
+        options.add_experimental_option("prefs", {
+            "download.default_directory": self.download_path.get(),
+            "plugins.always_open_pdf_externally": True,
+            "download.prompt_for_download": False
+        })
+
+        try:
+            self.status_msg.set("Opening Secure Session (Chrome 144)...")
+            driver = uc.Chrome(options=options, browser_executable_path=chrome_bin, version_main=144)
+            wait = WebDriverWait(driver, 20)
+
+            # Phase: Acquisition
+            self.status_msg.set("Scanning PWYW Content...")
+            driver.get("https://www.drivethrurpg.com/en/browse?pwvw=true&ruleSystem=44827")
+            time.sleep(5) 
+            
+            links = [l.get_attribute('href') for l in driver.find_elements(By.CSS_SELECTOR, "a.product-title")]
+            for i, url in enumerate(links):
+                try:
+                    driver.get(url)
+                    p_field = wait.until(EC.presence_of_element_located((By.ID, "pwyw_price")))
+                    p_field.clear()
+                    p_field.send_keys("0")
+                    wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input[type='submit'][value*='Cart']"))).click()
+                    self.log(f"Acquired: {url.split('/')[-1]}")
+                except:
+                    self.log(f"Skipped: {url.split('/')[-1]}")
+                
+                self.progress_val.set(int(((i+1)/len(links))*100))
+                time.sleep(5)
+
+            # Phase: Transaction
+            self.status_msg.set("Finalizing $0.00 Transaction...")
+            driver.get("https://www.drivethrurpg.com/shopping_cart.php")
+            try:
+                wait.until(EC.element_to_be_clickable((By.LINK_TEXT, "Checkout"))).click()
+                wait.until(EC.element_to_be_clickable((By.ID, "confirm_button"))).click()
+                self.log("Success: Contents added to library.")
+            except:
+                self.log("Cart empty or already processed.")
+
+            self.organize_and_dedupe()
+
+        except Exception as e:
+            self.log(f"CRITICAL: {str(e)}")
+        finally:
+            self.status_msg.set("Local Sync Complete")
+            self.start_btn.config(state="normal")
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = DTRPG_Local_Search_System(root)
+    root.mainloop()

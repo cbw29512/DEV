@@ -1,0 +1,102 @@
+[
+  {
+    "id": "meat-rotisserie-chickens",
+    "category": "Meat",
+    "text": "2 rotisserie chickens"
+  },
+  {
+    "id": "meat-ground-beef",
+    "category": "Meat",
+    "text": "4 lb ground beef — 90/10 or 93/7"
+  },
+  {
+    "id": "meat-chicken-wings",
+    "category": "Meat",
+    "text": "1 bag chicken wings"
+  },
+  {
+    "id": "meat-steaks",
+    "category": "Meat",
+    "text": "4 decent steaks"
+  },
+  {
+    "id": "meat-pork-chops",
+    "category": "Meat",
+    "text": "Pork chops"
+  },
+  {
+    "id": "protein-greek-yogurt",
+    "category": "Dairy / Protein",
+    "text": "4 containers Greek yogurt"
+  },
+  {
+    "id": "protein-vanilla-powder",
+    "category": "Dairy / Protein",
+    "text": "Vanilla protein powder"
+  },
+  {
+    "id": "protein-chocolate-chip-bars",
+    "category": "Dairy / Protein",
+    "text": "Chocolate chip protein bars"
+  },
+  {
+    "id": "dairy-healthy-butter",
+    "category": "Dairy / Protein",
+    "text": "Healthy butter/spread"
+  },
+  {
+    "id": "frozen-blueberries",
+    "category": "Frozen",
+    "text": "2 bags frozen blueberries"
+  },
+  {
+    "id": "frozen-mixed-vegetables",
+    "category": "Frozen",
+    "text": "2 bags mixed vegetables"
+  },
+  {
+    "id": "produce-bagged-salads",
+    "category": "Produce",
+    "text": "2 bagged salads"
+  },
+  {
+    "id": "pantry-rice",
+    "category": "Pantry",
+    "text": "1 bag rice"
+  },
+  {
+    "id": "pantry-veg-all",
+    "category": "Pantry",
+    "text": "4 cans Veg-All"
+  },
+  {
+    "id": "pantry-pineapple",
+    "category": "Pantry",
+    "text": "6 cans pineapple in its own juice"
+  },
+  {
+    "id": "pantry-olives",
+    "category": "Pantry",
+    "text": "Olives"
+  },
+  {
+    "id": "pantry-chili-beans",
+    "category": "Pantry",
+    "text": "Chili beans"
+  },
+  {
+    "id": "pantry-shake-n-bake",
+    "category": "Pantry",
+    "text": "Shake 'N Bake for pork chops"
+  },
+  {
+    "id": "snacks-potato-chips",
+    "category": "Snacks",
+    "text": "1 bag potato chips — flavor undecided"
+  },
+  {
+    "id": "drinks-dr-pepper-zero",
+    "category": "Drinks",
+    "text": "Dr Pepper Zero"
+  }
+]

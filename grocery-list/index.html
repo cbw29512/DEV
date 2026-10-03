@@ -1,205 +1,25 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Running Grocery List</title>
-  <style>
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      max-width: 720px;
-      margin: 0 auto;
-      padding: 24px;
-      background: #f7f7f7;
-      color: #111;
-    }
-    h1 { margin-bottom: 8px; }
-    .sub { color: #555; margin-bottom: 20px; }
-    .toolbar {
-      display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
-      margin-bottom: 18px;
-    }
-    input[type="text"] {
-      flex: 1;
-      min-width: 220px;
-      padding: 12px;
-      font-size: 16px;
-      border: 1px solid #bbb;
-      border-radius: 10px;
-    }
-    button {
-      padding: 11px 14px;
-      border: 0;
-      border-radius: 10px;
-      background: #222;
-      color: white;
-      font-size: 15px;
-      cursor: pointer;
-    }
-    button.secondary { background: #666; }
-    .section {
-      background: white;
-      border-radius: 14px;
-      padding: 14px 16px;
-      margin-bottom: 14px;
-      box-shadow: 0 1px 4px rgba(0,0,0,.08);
-    }
-    .section h2 {
-      font-size: 18px;
-      margin: 0 0 10px;
-    }
-    .item {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      padding: 9px 0;
-      border-bottom: 1px solid #eee;
-    }
-    .item:last-child { border-bottom: 0; }
-    .item input[type="checkbox"] {
-      width: 22px;
-      height: 22px;
-    }
-    .done {
-      text-decoration: line-through;
-      color: #888;
-    }
-    .delete {
-      margin-left: auto;
-      background: transparent;
-      color: #a00;
-      padding: 4px 8px;
-      font-size: 18px;
-    }
-    .count {
-      font-size: 14px;
-      color: #666;
-      margin-bottom: 12px;
-    }
-  </style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#f7f7f7">
+  <title>Chris's Grocery List</title>
+  <link rel="stylesheet" href="./styles.css">
 </head>
 <body>
-  <h1>Running Grocery List</h1>
-  <div class="sub">Check items off as you shop. Your checkmarks stay saved in this browser.</div>
-
-  <div class="toolbar">
-    <input id="newItem" type="text" placeholder="Add a grocery item..." />
-    <button onclick="addItem()">Add</button>
-    <button class="secondary" onclick="clearCompleted()">Clear checked</button>
-  </div>
-
-  <div class="count" id="count"></div>
-  <div id="list"></div>
-
-<script>
-const defaultItems = [
-  ["Meat", "2 rotisserie chickens"],
-  ["Meat", "4 lb ground beef — 90/10 or 93/7"],
-  ["Meat", "1 bag chicken wings"],
-  ["Meat", "4 decent steaks"],
-  ["Meat", "Pork chops"],
-  ["Dairy / Protein", "4 containers Greek yogurt"],
-  ["Dairy / Protein", "Vanilla protein powder"],
-  ["Dairy / Protein", "Chocolate chip protein bars"],
-  ["Dairy / Protein", "Healthy butter/spread"],
-  ["Frozen", "2 bags frozen blueberries"],
-  ["Frozen", "2 bags mixed vegetables"],
-  ["Produce", "2 bagged salads"],
-  ["Pantry", "1 bag rice"],
-  ["Pantry", "4 cans Veg-All"],
-  ["Pantry", "6 cans pineapple in its own juice"],
-  ["Pantry", "Olives"],
-  ["Pantry", "Chili beans"],
-  ["Pantry", "Shake 'N Bake for pork chops"],
-  ["Snacks", "1 bag potato chips — flavor undecided"],
-  ["Drinks", "Dr Pepper Zero"]
-].map(([category, text], i) => ({ id: i + 1, category, text, done: false }));
-
-let items = JSON.parse(localStorage.getItem("runningGroceryList") || "null") || defaultItems;
-
-function save() {
-  localStorage.setItem("runningGroceryList", JSON.stringify(items));
-}
-
-function render() {
-  const list = document.getElementById("list");
-  list.innerHTML = "";
-
-  const categories = [...new Set(items.map(i => i.category))];
-  for (const category of categories) {
-    const section = document.createElement("div");
-    section.className = "section";
-    section.innerHTML = `<h2>${category}</h2>`;
-
-    items.filter(i => i.category === category).forEach(item => {
-      const row = document.createElement("div");
-      row.className = "item";
-
-      const cb = document.createElement("input");
-      cb.type = "checkbox";
-      cb.checked = item.done;
-      cb.onchange = () => {
-        item.done = cb.checked;
-        save();
-        render();
-      };
-
-      const label = document.createElement("span");
-      label.textContent = item.text;
-      if (item.done) label.className = "done";
-
-      const del = document.createElement("button");
-      del.className = "delete";
-      del.textContent = "×";
-      del.title = "Remove item";
-      del.onclick = () => {
-        items = items.filter(i => i.id !== item.id);
-        save();
-        render();
-      };
-
-      row.append(cb, label, del);
-      section.appendChild(row);
-    });
-
-    list.appendChild(section);
-  }
-
-  const remaining = items.filter(i => !i.done).length;
-  document.getElementById("count").textContent =
-    `${remaining} item${remaining === 1 ? "" : "s"} left`;
-}
-
-function addItem() {
-  const input = document.getElementById("newItem");
-  const text = input.value.trim();
-  if (!text) return;
-
-  items.push({
-    id: Date.now(),
-    category: "Added Items",
-    text,
-    done: false
-  });
-
-  input.value = "";
-  save();
-  render();
-}
-
-function clearCompleted() {
-  items = items.filter(i => !i.done);
-  save();
-  render();
-}
-
-document.getElementById("newItem").addEventListener("keydown", e => {
-  if (e.key === "Enter") addItem();
-});
-
-render();
-</script>
+  <main>
+    <h1>Grocery List</h1>
+    <p class="sub">Check an item and it leaves the active list. Show checked items to undo one.</p>
+    <div id="error" class="error" hidden>Could not load the grocery list. Try again when you have a connection.</div>
+    <p id="status" class="status">Loading…</p>
+    <div class="toolbar">
+      <button id="toggleCompleted" class="secondary" type="button">Show checked</button>
+      <button id="uncheckAll" class="secondary" type="button">Uncheck all</button>
+    </div>
+    <div id="active"></div>
+    <div id="completed" hidden></div>
+  </main>
+  <script src="./app.js" defer></script>
 </body>
 </html>
